@@ -1,0 +1,214 @@
+// src/main.rs
+use clap::Parser;
+use dialoguer::{Input, Select, Confirm};
+use std::process::{Command, Stdio};
+use std::path::PathBuf;
+
+/// A simple YouTube downloader using yt-dlp
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Video/Playlist URL (automation mode)
+    #[arg(short, long)]
+    url: Option<String>,
+
+    /// Download format (e.g. 'best', '137+140', 'mp4')
+    #[arg(short, long, default_value = "best")]
+    format: String,
+
+    /// Output directory
+    #[arg(short = 'd', long, default_value = "./downloads")]
+    output_dir: PathBuf,
+
+    /// Download entire playlist
+    #[arg(short = 'p', long, default_value_t = false)]
+    playlist: bool,
+
+    /// Force interactive mode even if URL is provided
+    #[arg(short = 'i', long, default_value_t = false)]
+    interactive: bool,
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // Check if yt-dlp is available
+    if !is_yt_dlp_installed() {
+        eprintln!("Error: 'yt-dlp' is not installed or not found in PATH.");
+        eprintln!("Install it from https://github.com/yt-dlp/yt-dlp");
+        return;
+    }
+
+    // Ensure output directory exists
+    if let Err(e) = std::fs::create_dir_all(&args.output_dir) {
+        eprintln!("Failed to create output directory: {}", e);
+        return;
+    }
+
+    // Decide mode: automation if URL provided and not forced interactive
+    if args.url.is_some() && !args.interactive {
+        run_automation(&args);
+    } else {
+        run_interactive();
+    }
+}
+
+fn is_yt_dlp_installed() -> bool {
+    Command::new("yt-dlp")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Automation mode: use the provided CLI arguments.
+fn run_automation(args: &Args) {
+    let url = args.url.as_ref().unwrap();
+    let mut cmd = Command::new("yt-dlp");
+
+    cmd.arg("-f").arg(&args.format);
+    cmd.arg("-o").arg(args.output_dir.join("%(title)s.%(ext)s"));
+    cmd.arg("--no-playlist");
+    if args.playlist {
+        cmd.arg("--yes-playlist");
+    }
+    // Add additional flags if desired (e.g., --embed-thumbnail)
+    cmd.arg(url);
+
+    println!("Running: {:?}", cmd);
+    let status = cmd.status().expect("Failed to execute yt-dlp");
+    if !status.success() {
+        eprintln!("Download failed with status: {}", status);
+    }
+}
+
+/// Interactive mode: step-by-step menu using dialoguer.
+fn run_interactive() {
+    loop {
+        let options = &[
+            "Download a single video",
+            "Download a playlist",
+            "List available formats (and choose one)",
+            "Change download directory",
+            "Exit",
+        ];
+
+        let selection = Select::new()
+            .with_prompt("What would you like to do?")
+            .items(options)
+            .default(0)
+            .interact()
+            .unwrap();
+
+        match selection {
+            0 => download_video(false),
+            1 => download_video(true),
+            2 => list_and_download_format(),
+            3 => {
+                // Just print current dir and let them set via automation arg next time
+                println!(
+                    "Current download directory is set via --output-dir flag (default ./downloads). Use that in automation mode."
+                );
+                // In a full app we could persist config, but keeping it simple.
+            }
+            4 => {
+                println!("Goodbye!");
+                break;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Ask for URL and start download (single or playlist).
+fn download_video(is_playlist: bool) {
+    let url: String = Input::new()
+        .with_prompt("Enter video/playlist URL")
+        .interact_text()
+        .unwrap();
+
+    let format: String = Input::new()
+        .with_prompt("Enter format (e.g. 'best', '18', or leave empty for default 'best')")
+        .default("best".into())
+        .interact_text()
+        .unwrap();
+
+    let output_dir: String = Input::new()
+        .with_prompt("Output directory")
+        .default("./downloads".into())
+        .interact_text()
+        .unwrap();
+
+    let mut cmd = Command::new("yt-dlp");
+    cmd.arg("-f").arg(&format);
+    cmd.arg("-o").arg(format!("{}/%(title)s.%(ext)s", output_dir));
+    if !is_playlist {
+        cmd.arg("--no-playlist");
+    }
+    cmd.arg(&url);
+
+    println!("Downloading...");
+    let status = cmd.status().expect("Failed to start yt-dlp");
+    if status.success() {
+        println!("Download completed successfully.");
+    } else {
+        eprintln!("Download failed.");
+    }
+}
+
+/// List available formats for a URL, then optionally download with selected format.
+fn list_and_download_format() {
+    let url: String = Input::new()
+        .with_prompt("Enter the video URL to inspect formats")
+        .interact_text()
+        .unwrap();
+
+    println!("Fetching available formats...");
+    let output = Command::new("yt-dlp")
+        .arg("--list-formats")
+        .arg(&url)
+        .output()
+        .expect("Failed to run yt-dlp --list-formats");
+
+    if !output.status.success() {
+        eprintln!("Could not retrieve formats. Is the URL valid?");
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{}", stdout);
+
+    let download_now = Confirm::new()
+        .with_prompt("Do you want to download this video with a specific format code?")
+        .default(true)
+        .interact()
+        .unwrap();
+
+    if download_now {
+        let format_code: String = Input::new()
+            .with_prompt("Enter the format code (e.g. 137+140)")
+            .interact_text()
+            .unwrap();
+
+        let output_dir: String = Input::new()
+            .with_prompt("Output directory")
+            .default("./downloads".into())
+            .interact_text()
+            .unwrap();
+
+        let mut cmd = Command::new("yt-dlp");
+        cmd.arg("-f").arg(&format_code);
+        cmd.arg("-o").arg(format!("{}/%(title)s.%(ext)s", output_dir));
+        cmd.arg("--no-playlist");
+        cmd.arg(&url);
+
+        let status = cmd.status().expect("Failed to run download");
+        if status.success() {
+            println!("Download complete.");
+        } else {
+            eprintln!("Download failed.");
+        }
+    }
+}
