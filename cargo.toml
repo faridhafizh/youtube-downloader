@@ -1,11 +1,30 @@
 [package]
 name = "yt-downloader"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
+# Dua binary: CLI dan GUI (GUI hanya dikompilasi jika fitur 'gui' aktif)
+[[bin]]
+name = "yt-downloader"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "yt-downloader-gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = ["eframe", "egui", "rfd"]
+
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-dialoguer = "0.11"
+clap = { version = "4", features = ["derive"] }
 console = "0.15"
-indicatif = "0.17"
-regex = "1"
+dialoguer = "0.11"
+anyhow = "1"
+thiserror = "1"
+
+# GUI (opsional)
+eframe = { version = "0.27", optional = true }
+egui = { version = "0.27", optional = true }
+rfd = { version = "0.14", optional = true }

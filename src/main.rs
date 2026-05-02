@@ -3,9 +3,10 @@ use console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// A simple YouTube downloader using yt-dlp
 #[derive(Parser, Debug)]
@@ -37,7 +38,10 @@ fn main() {
 
     // Check if yt-dlp is available
     if !is_yt_dlp_installed() {
-        eprintln!("{} 'yt-dlp' is not installed or not found in PATH.", style("Error:").red().bold());
+        eprintln!(
+            "{} 'yt-dlp' is not installed or not found in PATH.",
+            style("Error:").red().bold()
+        );
         eprintln!("Install it from https://github.com/yt-dlp/yt-dlp");
         return;
     }
@@ -82,7 +86,6 @@ fn run_automation(args: &Args) {
     }
     cmd.arg(url);
 
-    // Use the new progress bar downloader
     if let Err(e) = run_with_progress(cmd) {
         eprintln!("{} {}", style("Error:").red().bold(), e);
     }
@@ -93,18 +96,17 @@ fn run_interactive() {
     let theme = ColorfulTheme::default();
 
     loop {
-        // Clean header
         println!("\n{}", style("🎬 YouTube Downloader (interactive)").bold().cyan());
         println!("{}", style("──────────────────────────────────────").dim());
 
-    let options = &[
-        "📥 Download a single video",
-        "🎵 Download audio only (MP3/M4A)",
-        "📜 Download a playlist",
-        "📊 List available formats (and choose one)",
-        "📁 Change download directory",
-        "🚪 Exit",
-    ];
+        let options = &[
+            "📥 Download a single video",
+            "🎵 Download audio only (MP3/M4A)",
+            "📜 Download a playlist",
+            "📊 List available formats (and choose one)",
+            "📁 Change download directory",
+            "🚪 Exit",
+        ];
 
         let selection = Select::with_theme(&theme)
             .with_prompt("What would you like to do?")
@@ -152,14 +154,14 @@ fn download_video(is_playlist: bool, audio_only: bool) {
             "🔊 MP3 128kbps",
             "🎼 M4A (AAC)",
         ];
-        
+
         let audio_quality = Select::with_theme(&theme)
             .with_prompt("Select audio quality")
             .items(audio_options)
             .default(0)
             .interact()
             .unwrap();
-            
+
         match audio_quality {
             0 => "bestaudio".into(),
             1 => "bestaudio[ext=mp3]/bestaudio --audio-format mp3 --audio-quality 320k".into(),
@@ -167,7 +169,7 @@ fn download_video(is_playlist: bool, audio_only: bool) {
             3 => "bestaudio[ext=mp3]/bestaudio --audio-format mp3 --audio-quality 192k".into(),
             4 => "bestaudio[ext=mp3]/bestaudio --audio-format mp3 --audio-quality 128k".into(),
             5 => "bestaudio[ext=m4a]/bestaudio".into(),
-            _ => "bestaudio".into()
+            _ => "bestaudio".into(),
         }
     } else {
         Input::with_theme(&theme)
@@ -203,17 +205,17 @@ fn download_video(is_playlist: bool, audio_only: bool) {
     }
 }
 
-/// Download audio only mode handler
+/// Download audio only mode handler.
 fn download_audio_only() {
     let theme = ColorfulTheme::default();
-    
+
     let download_type = Select::with_theme(&theme)
         .with_prompt("What do you want to download?")
         .items(&["Single video audio", "Full playlist audio"])
         .default(0)
         .interact()
         .unwrap();
-        
+
     download_video(download_type == 1, true);
 }
 
@@ -234,7 +236,10 @@ fn list_and_download_format() {
         .expect("Failed to run yt-dlp --list-formats");
 
     if !output.status.success() {
-        eprintln!("{} Could not retrieve formats. Is the URL valid?", style("Error:").red().bold());
+        eprintln!(
+            "{} Could not retrieve formats. Is the URL valid?",
+            style("Error:").red().bold()
+        );
         return;
     }
 
@@ -275,20 +280,30 @@ fn list_and_download_format() {
 
 // ── Progress bar helper ──────────────────────────────────────────────
 
-/// Spawns the given yt-dlp command and displays an animated progress bar
-/// by parsing its stderr output.
+/// Spawns the given yt-dlp command and displays a real-time progress bar.
+/// Fixes applied:
+/// 1. PYTHONUNBUFFERED=1 → Forces Python to flush stderr immediately (prevents block buffering)
+/// 2. --color never → Strips ALL ANSI escape codes that break regex parsing
+/// 3. --newline → Forces yt-dlp to output progress on new lines instead of \r overwrites
+/// 4. Robust chunk parsing → Handles partial reads and separators safely
 fn run_with_progress(mut cmd: Command) -> Result<(), String> {
+    cmd.env("PYTHONUNBUFFERED", "1");
+    cmd.arg("--color").arg("never");
+    cmd.arg("--newline");
+    cmd.arg("--no-warnings");
+
     let pb = ProgressBar::new(100);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
                 "{spinner:.magenta.bold} {elapsed_precise:.dim} [{bar:60}] \
-                {percent:>3}% {speed:>10} | ETA: {eta:>5} | {msg:.dim}"
+                {percent:>3}% | ETA: {eta:>5} | {msg}",
             )
             .unwrap()
             .progress_chars("█▓▒░ "),
     );
     pb.set_message("Initializing download...");
+    pb.enable_steady_tick(Duration::from_millis(100));
 
     let mut child = cmd
         .stdout(Stdio::null())
@@ -297,52 +312,45 @@ fn run_with_progress(mut cmd: Command) -> Result<(), String> {
         .map_err(|e| format!("Failed to start yt-dlp: {}", e))?;
 
     let stderr = child.stderr.take().ok_or("Could not capture stderr")?;
-    let reader = BufReader::new(stderr);
+    let mut reader = BufReader::new(stderr);
 
-    // Regex patterns used for parsing
-    let re_percent = Regex::new(r"(\d+\.?\d*)%").unwrap();
-    let re_speed = Regex::new(r"(\d+\.?\d*\s*[KM]iB/s|\d+\.?\d*\s*[kK]B/s)").unwrap();
+    // Regex patterns for parsing yt-dlp output
+    let re_percent = Regex::new(r"(\d+(?:\.\d+)?)\s*%").unwrap();
+    let re_speed = Regex::new(r"([\d.]+\s*[KMGkmg]i?[Bb]/s)").unwrap();
     let re_destination = Regex::new(r"\[download\] Destination: (.+)").unwrap();
 
-    let mut file_count = 0;
-    let mut current_file = String::new();
+    let mut file_count = 0usize;
+    let mut current_filename = String::new();
+    let mut leftover: Vec<u8> = Vec::new();
+    let mut raw_buf = [0u8; 1024];
 
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Read error: {}", e))?;
+    loop {
+        let n = reader
+            .read(&mut raw_buf)
+            .map_err(|e| format!("Read error: {}", e))?;
 
-        // Look for a destination filename → update the bar message
-        if let Some(caps) = re_destination.captures(&line) {
-            let fname = caps.get(1).unwrap().as_str();
-            current_file = fname.to_string();
-            file_count += 1;
-
-            let filename = std::path::Path::new(fname)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(fname);
-
-            pb.set_message(format!("📄 {}", filename));
-        }
-
-        // Parse download speed
-        if let Some(caps) = re_speed.captures(&line) {
-            let speed = caps.get(1).unwrap().as_str();
-            pb.set_message(speed.to_string());
-        }
-
-        // Look for a percentage
-        if let Some(caps) = re_percent.captures(&line) {
-            let percent_str = caps.get(1).unwrap().as_str();
-            if let Ok(percent) = percent_str.parse::<f64>() {
-                let pos = percent.min(100.0).max(0.0) as u64;
-                pb.set_position(pos);
-
-                if pos >= 100 {
-                    pb.println(format!(" ✅  File completed: {}", current_file));
-                    pb.reset();
-                    pb.set_message("Waiting for next file...");
-                }
+        if n == 0 {
+            if !leftover.is_empty() {
+                let line = String::from_utf8_lossy(&leftover).to_string();
+                process_line(&line, &pb, &re_percent, &re_speed, &re_destination, &mut file_count, &mut current_filename);
+                leftover.clear();
             }
+            break;
+        }
+
+        leftover.extend_from_slice(&raw_buf[..n]);
+
+        // Process all complete lines in the buffer
+        while let Some(pos) = leftover.iter().position(|&b| b == b'\r' || b == b'\n') {
+            let chunk = leftover[..pos].to_vec();
+            leftover.drain(..=pos); // Remove chunk + separator
+
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let line = String::from_utf8_lossy(&chunk).to_string();
+            process_line(&line, &pb, &re_percent, &re_speed, &re_destination, &mut file_count, &mut current_filename);
         }
     }
 
@@ -351,8 +359,16 @@ fn run_with_progress(mut cmd: Command) -> Result<(), String> {
     if status.success() {
         pb.finish_with_message("✨ Download completed successfully");
         println!("\n{}", style("───────────────────────────────────────────────────────").dim());
-        println!(" {} Total files downloaded: {}", style("✅").green().bold(), file_count);
-        println!(" {} Total time elapsed:    {:?}", style("⏱️").cyan(), pb.elapsed());
+        println!(
+            " {} Total files downloaded: {}",
+            style("✅").green().bold(),
+            file_count
+        );
+        println!(
+            " {} Total time elapsed:    {:?}",
+            style("⏱️").cyan(),
+            pb.elapsed()
+        );
         println!("{}", style("───────────────────────────────────────────────────────").dim());
         println!();
         Ok(())
@@ -362,5 +378,62 @@ fn run_with_progress(mut cmd: Command) -> Result<(), String> {
             "yt-dlp exited with status {}",
             status.code().unwrap_or(-1)
         ))
+    }
+}
+
+/// Processes a single line of yt-dlp output and updates the progress bar accordingly.
+fn process_line(
+    line: &str,
+    pb: &ProgressBar,
+    re_percent: &Regex,
+    re_speed: &Regex,
+    re_destination: &Regex,
+    file_count: &mut usize,
+    current_filename: &mut String,
+) {
+    // Detect new file destination → update progress bar message
+    if let Some(caps) = re_destination.captures(line) {
+        let full_path = caps.get(1).unwrap().as_str();
+        *current_filename = full_path.to_string();
+        *file_count += 1;
+
+        let fname = std::path::Path::new(full_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(full_path);
+
+        pb.set_message(format!("📄 {}", fname));
+        return;
+    }
+
+    // Detect download percentage → update progress bar position
+    if let Some(caps) = re_percent.captures(line) {
+        let percent_str = caps.get(1).unwrap().as_str().trim();
+        
+        if let Ok(percent) = percent_str.parse::<f64>() {
+            let pos = percent.clamp(0.0, 100.0) as u64;
+            pb.set_position(pos);
+
+            // Extract speed if present
+            let speed_str = re_speed
+                .captures(line)
+                .and_then(|c| c.get(1))
+                .map(|m| format!(" @ {}", m.as_str().trim()))
+                .unwrap_or_default();
+
+            let short_name = std::path::Path::new(current_filename.as_str())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(current_filename.as_str());
+
+            pb.set_message(format!("📄 {}{}", short_name, speed_str));
+
+            // File completed
+            if pos >= 100 {
+                pb.println(format!(" ✅  Completed: {}", current_filename));
+                pb.reset();
+                pb.set_message("Waiting for next file...");
+            }
+        }
     }
 }
